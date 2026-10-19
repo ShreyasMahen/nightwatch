@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+screenshots
+evidence
+*.pdf
+*.tgz
+.DS_Store
