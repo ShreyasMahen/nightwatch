@@ -2,6 +2,11 @@
 
 import asyncio
 import random
+import math
+import time
+from contextlib import contextmanager
+
+from checkpoint import CheckpointError
 from collections import Counter
 
 
@@ -10,7 +15,7 @@ class RuleError(Exception):
 
 
 class Game:
-    def __init__(self, roster, night=60, discussion=45, vote=30, seed=None):
+    def __init__(self, roster, night=60, discussion=45, vote=30, seed=None, checkpoint=None):
         if not 5 <= len(roster) <= 7 or len(set(roster)) != len(roster):
             raise ValueError("Choose 5 to 7 distinct Linux users")
         self.roster = list(roster)
@@ -22,19 +27,127 @@ class Game:
         self.roles, self.alive, self.choices = {}, set(roster), {}
         self.last_protected = None
         self.timer = None
+        self.checkpoint = checkpoint
+        self.deadline_at = None
+        self.saved_remaining = 0
+        self.inspections = {}
+        self.winner = None
+        self.failed = asyncio.Event()
+        self._outbox = None
+
+    def deliver(self, method, *args):
+        if self._outbox is None:
+            return getattr(self.hub, method)(*args)
+        self._outbox.append((method, args))
+
+    @contextmanager
+    def atomic(self):
+        if self._outbox is not None:
+            raise RuntimeError("Nested game transaction")
+        self._outbox = []
+        try:
+            yield
+            if self.checkpoint:
+                self.checkpoint.save(self.record())
+            events = self._outbox
+        except BaseException:
+            self.failed.set()
+            if self.timer:
+                self.timer.cancel()
+            raise
+        finally:
+            self._outbox = None
+        for method, args in events:
+            if method == "print":
+                print(*args, flush=True)
+            else:
+                getattr(self.hub, method)(*args)
+
+    def record(self):
+        return {"schema": 1, "roster": self.roster, "durations": self.durations,
+                "phase": self.phase, "phase_id": self.phase_id, "round": self.round,
+                "roles": self.roles, "alive": sorted(self.alive), "choices": self.choices,
+                "last_protected": self.last_protected, "inspections": self.inspections,
+                "winner": self.winner,
+                "remaining": max(0, self.deadline_at-time.monotonic()) if self.deadline_at else 0}
+
+    @classmethod
+    def restore(cls, record, checkpoint=None):
+        try:
+            if record.get("schema") != 1:
+                raise ValueError("unknown checkpoint schema")
+            roster, durations = record["roster"], record["durations"]
+            if not isinstance(roster, list) or not all(isinstance(p, str) for p in roster):
+                raise ValueError("invalid roster")
+            if set(durations) != {"night", "discussion", "vote"} or not all(
+                    type(v) in (int, float) and math.isfinite(v) and v > 0 for v in durations.values()):
+                raise ValueError("invalid durations")
+            game = cls(roster, **durations, checkpoint=checkpoint)
+            phase = record["phase"]
+            if phase not in ("lobby", "night", "discussion", "vote", "finished"):
+                raise ValueError("invalid phase")
+            roles, alive, choices = record["roles"], record["alive"], record["choices"]
+            if not isinstance(roles, dict) or not isinstance(choices, dict) or not isinstance(alive, list):
+                raise ValueError("invalid state types")
+            if not set(alive) <= set(roster) or len(alive) != len(set(alive)):
+                raise ValueError("invalid living players")
+            if phase != "lobby":
+                expected = Counter({"wolf": 2 if len(roster) == 7 else 1, "seer": 1, "guard": 1,
+                                    "villager": len(roster) - (4 if len(roster) == 7 else 3)})
+                if set(roles) != set(roster) or Counter(roles.values()) != expected:
+                    raise ValueError("invalid roles")
+            elif roles or choices:
+                raise ValueError("lobby cannot contain dealt roles or actions")
+            if not set(choices) <= set(alive) or any(v is not None and v not in alive for v in choices.values()):
+                raise ValueError("invalid actions")
+            remaining = record["remaining"]
+            if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining < 0:
+                raise ValueError("invalid timer")
+            for key in ["phase_id", "round"]:
+                if type(record[key]) is not int or record[key] < 0:
+                    raise ValueError("invalid phase number")
+            if record["last_protected"] is not None and record["last_protected"] not in roster:
+                raise ValueError("invalid guard history")
+            inspections = record["inspections"]
+            if not isinstance(inspections, dict) or any(
+                name not in roles or roles[name] != "seer" or not isinstance(v, dict)
+                or v.get("target") not in roster or v.get("alignment") not in ("wolf", "village")
+                or not isinstance(v.get("text"), str) for name, v in inspections.items()):
+                raise ValueError("invalid inspection history")
+            winner = record["winner"]
+            if (phase == "finished") != (winner in ("VILLAGE", "WOLVES")):
+                raise ValueError("invalid winner")
+            game.phase, game.phase_id, game.round = phase, record["phase_id"], record["round"]
+            game.roles, game.alive, game.choices = roles.copy(), set(alive), choices.copy()
+            game.last_protected, game.inspections, game.winner = record["last_protected"], inspections.copy(), winner
+            game.saved_remaining = min(remaining, durations.get(phase, remaining))
+            return game
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise CheckpointError("Invalid checkpoint; refusing to start a replacement match") from exc
+
+    def resume(self):
+        with self.atomic():
+            if self.phase in self.durations:
+                self.deadline_at = time.monotonic() + self.saved_remaining
+                self.timer = asyncio.create_task(self.deadline(self.phase_id, self.saved_remaining))
+            self.announce(f"RECOVERED round {self.round} / {self.phase.upper()}; roles and accepted actions restored.")
 
     def tell(self, user, text, kind="notice", **extra):
-        self.hub.send(user, {"kind": kind, "text": text, **extra})
+        self.deliver("send", user, {"kind": kind, "text": text, **extra})
 
     def announce(self, text):
-        self.hub.broadcast({"kind": "notice", "text": text})
-        print(text, flush=True)
+        self.deliver("broadcast", {"kind": "notice", "text": text})
+        if self._outbox is None:
+            print(text, flush=True)
+        else:
+            self._outbox.append(("print", (text,)))
 
     def snapshot(self):
         return {"kind": "state", "phase": self.phase, "phase_id": self.phase_id,
                 "round": self.round, "alive": sorted(self.alive),
                 "connected": sorted(self.hub.peers),
-                "seconds": self.durations.get(self.phase, 0)}
+                "seconds": max(0, self.deadline_at - time.monotonic()) if self.deadline_at else 0,
+                "majority_needed": len(self.alive) // 2 + 1}
 
     def reveal_private(self, user):
         role = self.roles[user]
@@ -44,22 +157,31 @@ class Game:
 
     async def joined(self, user, pid, uid):
         async with self.lock:
-            self.announce(f"{user} connected (Linux UID {uid}, PID {pid}).")
-            if self.roles:
-                self.reveal_private(user)
-            if self.phase == "lobby" and set(self.roster) <= set(self.hub.peers):
-                wolves = 2 if len(self.roster) == 7 else 1
-                roles = ["wolf"] * wolves + ["seer", "guard"]
-                roles += ["villager"] * (len(self.roster) - len(roles))
-                self.random.shuffle(roles)
-                self.roles = dict(zip(self.roster, roles))
-                self.announce("All players joined. Secret roles have been dealt.")
-                for player in self.roster:
-                    self.reveal_private(player)
-                self.round = 1
-                self.transition("night")
-            else:
-                self.hub.send(user, self.snapshot())
+            with self.atomic():
+                self.announce(f"{user} connected (Linux UID {uid}, PID {pid}).")
+                if self.roles:
+                    self.reveal_private(user)
+                    if user in self.inspections:
+                        self.tell(user, self.inspections[user]["text"], "inspection", **{
+                            k: v for k, v in self.inspections[user].items() if k != "text"})
+                    if user in self.choices:
+                        self.tell(user, "Restored action: " + str(self.choices[user]), "ack")
+                if self.phase == "lobby" and set(self.roster) <= set(self.hub.peers):
+                    wolves = 2 if len(self.roster) == 7 else 1
+                    roles = ["wolf"] * wolves + ["seer", "guard"]
+                    roles += ["villager"] * (len(self.roster) - len(roles))
+                    self.random.shuffle(roles)
+                    self.roles = dict(zip(self.roster, roles))
+                    self.announce("All players joined. Secret roles have been dealt.")
+                    for player in self.roster:
+                        self.reveal_private(player)
+                    self.round = 1
+                    self.transition("night")
+                else:
+                    self.deliver("send", user, self.snapshot())
+                    if self.phase == "finished":
+                        self.tell(user, f"{self.winner} WIN! All roles are now revealed.",
+                                  "result", winner=self.winner, roles=self.roles)
 
     async def left(self, user):
         async with self.lock:
@@ -71,21 +193,23 @@ class Game:
         if self.timer and self.timer is not asyncio.current_task():
             self.timer.cancel()
         self.phase, self.phase_id, self.choices = phase, self.phase_id + 1, {}
+        self.deadline_at = time.monotonic() + self.durations[phase] if phase in self.durations else None
         self.announce(f"ROUND {self.round} / {phase.upper()}")
-        self.hub.broadcast(self.snapshot())
+        self.deliver("broadcast", self.snapshot())
         if phase in self.durations:
             self.timer = asyncio.create_task(self.deadline(self.phase_id, self.durations[phase]))
 
     async def deadline(self, phase_id, seconds):
         await asyncio.sleep(seconds)
         async with self.lock:
-            if self.phase_id == phase_id:
-                if self.phase == "night":
-                    self.resolve_night()
-                elif self.phase == "discussion":
-                    self.transition("vote")
-                elif self.phase == "vote":
-                    self.resolve_vote()
+            with self.atomic():
+                if self.phase_id == phase_id:
+                    if self.phase == "night":
+                        self.resolve_night()
+                    elif self.phase == "discussion":
+                        self.transition("vote")
+                    elif self.phase == "vote":
+                        self.resolve_vote()
 
     @staticmethod
     def clean_text(value):
@@ -97,17 +221,18 @@ class Game:
 
     async def message(self, user, message):
         async with self.lock:
-            try:
-                self.command(user, message)
-            except RuleError as exc:
-                self.tell(user, str(exc), "error")
+            with self.atomic():
+                try:
+                    self.command(user, message)
+                except RuleError as exc:
+                    self.tell(user, str(exc), "error")
 
     def command(self, user, message):
         cmd = message.get("cmd")
         if not isinstance(cmd, str):
             raise RuleError("Command must be a string")
         if cmd == "status":
-            self.hub.send(user, self.snapshot())
+            self.deliver("send", user, self.snapshot())
             return
         if self.phase in ("lobby", "finished"):
             raise RuleError("Wait for the game to start, or start a new game")
@@ -134,7 +259,7 @@ class Game:
                         raise RuleError("Whisper recipients must be living player names")
                     recipients = sorted(set(recipients + [user]))
                     scope = "PRIVATE to " + ",".join(recipients)
-            self.hub.multicast(recipients, {"kind": "chat", "sender": user,
+            self.deliver("multicast", recipients, {"kind": "chat", "sender": user,
                                          "scope": scope, "text": text})
             return
         required = {"strike": "wolf", "inspect": "seer", "protect": "guard"}
@@ -182,8 +307,9 @@ class Game:
         villagers = len(self.alive) - wolves
         winner = "VILLAGE" if wolves == 0 else "WOLVES" if wolves >= villagers else None
         if winner:
+            self.winner = winner
             self.transition("finished")
-            self.hub.broadcast({"kind": "result", "winner": winner, "roles": self.roles,
+            self.deliver("broadcast", {"kind": "result", "winner": winner, "roles": self.roles,
                                 "text": f"{winner} WIN! All roles are now revealed."})
             self.announce(f"GAME OVER: {winner} WIN")
             return True
@@ -194,8 +320,11 @@ class Game:
             if self.roles[player] == "seer" and self.choices.get(player) is not None:
                 target = self.choices[player]
                 alignment = "wolf" if self.roles[target] == "wolf" else "village"
-                self.tell(player, f"Your inspection: {target} is {alignment.upper()}.",
-                          "inspection", target=target, alignment=alignment)
+                self.inspections[player] = {
+                    "text": f"Your inspection: {target} is {alignment.upper()}.",
+                    "target": target, "alignment": alignment}
+                self.tell(player, self.inspections[player]["text"], "inspection",
+                          target=target, alignment=alignment)
         protected = next((self.choices.get(p) for p in self.alive if self.roles[p] == "guard"), None)
         self.last_protected = protected
         victim, _ = self.unique_plurality(self.choices.get(p) for p in self.alive
@@ -213,10 +342,11 @@ class Game:
         target, counts = self.unique_plurality(self.choices.get(p) for p in self.alive)
         self.announce("Vote totals: " + (", ".join(f"{p}={n}" for p, n in sorted(counts.items()))
                                         or "everyone abstained"))
-        if target:
-            self.eliminate(target, "the village vote")
+        threshold = len(self.alive) // 2 + 1
+        if target and counts[target] >= threshold:
+            self.eliminate(target, f"a majority vote ({counts[target]}/{len(self.alive)})")
         else:
-            self.announce("No unique voting leader: nobody was eliminated.")
+            self.announce(f"No strict majority ({threshold} votes required): nobody was eliminated.")
         if not self.finished():
             self.round += 1
             self.transition("night")

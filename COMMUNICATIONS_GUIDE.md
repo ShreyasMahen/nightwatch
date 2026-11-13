@@ -54,7 +54,8 @@ selected recipient. Broadcast uses the same mechanism for all active peers.
 Each connection is ordered, but there is no global simultaneous-delivery or
 all-or-nothing group-delivery guarantee. One disconnected recipient can miss
 a group message while the others receive it. Reconnection supplies the latest
-game state, not a durable replay of missed chats or inspections.
+game state. Chat is not durably replayed; the continuation also restores the
+latest private inspection result to the seer.
 
 ## Be ready to explain these questions
 
@@ -72,3 +73,62 @@ game state, not a durable replay of missed chats or inspections.
 Try one run with human commands, send a whisper to only one teammate, and
 disconnect/rejoin one client. Compare what appears in the other terminals.
 Ask classmates to challenge these assumptions and record their actual results.
+
+
+## Projects 2 and 3: what changed and why
+
+The communication primitive is still the original local asyncio UNIX stream
+socket. The new mechanism is isolation around each endpoint: one Linux user
+and one container per player. The moderator has a separate container. CPU,
+memory, process count, open files, writable storage, and network access are
+bounded. A shared socket volume lets these isolated processes communicate.
+The named-volume directory is owned by UID 10000, group 2000, mode 0750. The
+socket is mode 0660. Player mounts are read-only, which prevents changes to the
+directory while still allowing a connection to the socket. The private state
+volume is mounted only in the moderator.
+
+The kernel translates process identities across namespaces. Our cross-container
+run reported distinct UIDs but PID 0 from the moderator's view. Each client
+reported a distinct PID namespace with local PID 1. Authentication uses the UID,
+not this namespace-relative PID and not a client-supplied sender field.
+
+Christopher's README feedback prompted two other changes. A village vote now
+requires floor(living/2)+1 votes, including disconnected living players in the
+denominator. The moderator also saves match state. Its transaction queues
+messages, writes/fsyncs a temporary private JSON file, replaces/fsyncs the final
+checkpoint, then releases the queued messages. Therefore an acknowledgement
+means the choice was saved. A storage failure stops the moderator. No new IPC
+is hidden in checkpoint.py; its file operations are private moderator state.
+
+On restart, roles, actions, phase IDs, living players, guard history and latest
+seer result are restored. Time resumes from the last saved remaining duration,
+so downtime does not consume that saved remainder. This policy may replay some
+uncheckpointed clock time. Chat history is not recovered. The snapshot is not
+a replicated log or automatic failover service.
+
+Encryption and isolation solve different problems. This version keeps local
+UNIX sockets rather than opening a TCP service. The local channel is not TLS
+encrypted. Kernel identity and path permissions restrict ordinary users;
+container profiles restrict a player's processes and resource use. Host root,
+the Docker administrator and moderator remain trusted. Neither resource limits
+nor checkpointing hides secrets from those trusted administrators.
+
+The measured CPU check used 25000 microseconds of quota per 100000-microsecond
+period. A five-second busy loop averaged about 25.05% of one CPU while another
+player received nine status responses. The bounded process probe reached 32
+tasks. A memory hog exited 137 with one cgroup OOM kill; the real client,
+moderator and another player remained responsive. A SIGKILL/restart restored
+the saved match and it ended in a village victory after a three-of-four vote.
+Those are observations from the included run, not a claim of exhaustive safety.
+
+Questions to check understanding:
+
+1. Why can all clients have local PID 1 while being separate processes?
+2. Why does a socket connection still need message framing and authorization?
+3. How can one client's queue fill without blocking all other writers?
+4. Why must the checkpoint be committed before the acknowledgement is sent?
+5. What does fsync of the directory add after replacing the checkpoint file?
+6. Why can two votes out of five no longer eliminate a player?
+7. Which information is lost across a crash, and which state is restored?
+8. What could host root or the Docker administrator still do?
+9. Why did many separate interpreters trigger the memory cap before the PID cap?

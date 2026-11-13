@@ -12,3 +12,8 @@ FEEDBACK.md
 SUBMISSION_NOTES.md
 evidence/
 screenshots/
+
+# Continuation report, poster, and local records
+poster*.pdf
+report*.pdf
+.session*.json

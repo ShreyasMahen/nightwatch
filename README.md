@@ -1,30 +1,28 @@
 # Nightwatch: Signal & Shadow
 
-A text-based social deduction game for 5-7 players. The village must identify
-the hidden wolves before the wolves equal or outnumber the other survivors.
-Players exchange public arguments, private whispers, and secret role actions.
+Projects 2 and 3, one combined continuation of the original Project 1 game.
+Author: Shreyas Mahendra.
 
-**Communications library: [`comms.py`](comms.py), in the project root.**
-All communications between player users and the moderator pass through this
-single source file. It uses asynchronous UNIX-domain stream sockets, framed
-JSON, and Linux `SO_PEERCRED` authentication. There are no named pipes or
-third-party Python dependencies.
+Nightwatch is a text-based social deduction game for 5 to 7 players. It keeps
+Project 1's wolves, seer, guard, villagers, private messages, and timed phases.
+The new mechanism is **per-player container isolation with Linux cgroup limits**.
+Each player has a distinct Linux UID and a separate process/PID namespace.
+The moderator has its own container and a private persistent checkpoint volume.
 
-## Requirements
+**All game communication between player users is in the single file
+[`comms.py`](comms.py).** The original asynchronous UNIX stream socket primitive
+is retained. This submission takes the assignment's new-isolation option.
 
-- Docker Desktop on macOS/Windows, or Docker Engine on Linux.
-- Python 3.10 or newer on the host for the convenient `play.py` wrapper.
-- Internet access for the initial official `python:3.13-slim` image download.
-- The game itself runs on Python 3.13 inside Linux.
+## Quick start
 
-The host-side helper is intended for macOS, Windows, and Linux. It has been
-verified on macOS with Linux containers; Windows has not been separately tested.
-On Windows, use `py play.py ...` in place of `python3 play.py ...` if your Python
-installation provides the `py` launcher. Use Linux containers in Docker Desktop.
+Install and start Docker Desktop on macOS/Windows, or Docker Engine on Linux.
+Use Python 3 on the host. No third-party Python package is required by the game.
+On Windows, use WSL for the same commands, or replace `python3` with `py` if your
+host Python uses that launcher. The verified environment is macOS with Docker's
+Linux engine and cgroup v2; native Windows behavior has not been tested.
 
-## Quick demonstration
-
-Open Terminal in this extracted project folder and run:
+Download or extract the project, open a host terminal, and `cd` into the folder
+containing play.py. Run:
 
 ```sh
 python3 play.py build
@@ -32,26 +30,26 @@ python3 play.py test
 python3 play.py demo --players 7
 ```
 
-The demonstration runs seven independent clients under Linux users `p1` to
-`p7`, with UIDs 10001 to 10007 and different PIDs. It uses two-second phases
-and seed 7 for reproducibility. The bots use only their own roles and messages
-received through the same IPC library as human players. The moderator remains
-the authority for all game rules. The demo prints each player's verified UID
-and PID and saves complete transcripts in `evidence/demo/`. Its temporary
-container is removed after the run. These are simulated players, not a claim
-that seven humans participated.
+The demo uses scripted bots through the same client protocol. It starts one
+moderator container and one container per player, plays to a winner, records
+transcripts, and removes its uniquely named containers and volumes. A demo's
+output normally goes under evidence/isolated-demo. Use `--evidence PATH` to
+choose a different directory and `--keep` to retain containers for inspecting
+logs. Retained demo containers can be removed with `stop --session NAME --purge`.
 
-## Play with humans in five terminals
+The container image is `nightwatch-isolated`. Project 1's old image/container
+names are not used by this helper.
 
-First build the image and start a fresh moderator:
+## Interactive game
+
+Start the moderator from the project folder in your Mac/host terminal:
 
 ```sh
-python3 play.py build
-python3 play.py start
+python3 play.py start --players 5
 ```
 
-Open five Terminal tabs/windows in this folder. Run one of these commands in
-each tab, so every player has a separate client process and Linux identity:
+Open five separate host terminals in the same project folder. Run one command
+in each terminal:
 
 ```sh
 python3 play.py join p1
@@ -61,163 +59,207 @@ python3 play.py join p4
 python3 play.py join p5
 ```
 
-The first command belongs in the first tab, the second in the second tab, and
-so on. The game starts automatically when all five users connect. The moderator
-runs as Linux user `moderator` (UID 10000), never as a player.
+Each join command starts its own Linux container as the corresponding user.
+Once all players join, the moderator deals secret roles and starts the night.
+Type gameplay commands in the relevant player's terminal. The terminal used to
+start the moderator remains a host shell. You can use a full path to play.py
+instead of changing directories when opening a new terminal.
 
-For seven humans, use `python3 play.py start --players 7` and add p6 and p7.
-Five or six players have one wolf; seven players have two wolves. There is
-always one seer, one guard, and enough ordinary villagers to fill the roster.
+For seven players, start with `--players 7` and add p6 and p7. For a separate
+match, add the same `--session my-match` to start, join, stop, and resume.
 
-For example, the helper's p1 command executes:
+## Rules and commands
 
-```sh
-docker exec -it --user p1 nightwatch-game python3 client.py
+Five/six players have one wolf; seven players have two wolves. There is one
+seer, one guard, and enough villagers to fill the roster.
+
+- Night (60 seconds): wolves choose an attack and may use team chat; the seer
+  inspects one player; the guard protects one player, including themselves.
+  The guard cannot protect the same player on consecutive nights. A tied wolf
+  attack eliminates nobody. Inspection reveals wolf/village alignment only.
+- Discussion (45 seconds): public chat and selected-recipient whispers.
+- Vote (30 seconds): the same chat remains available while players vote.
+  Elimination requires **floor(living players / 2) + 1 votes for one target**.
+  Abstainers and disconnected living players still count in the denominator.
+  Two votes out of five, or two out of four, eliminate nobody. Three out of
+  five, or three out of four, are sufficient. This replaces Project 1's unique
+  plurality rule in response to Christopher Caperlac's feedback.
+- Eliminated players can watch but cannot act or chat. The village wins when
+  no wolves remain. Wolves win when they are at least as numerous as the rest.
+
+```text
+status                         current phase and living players
+say Hello everyone             public day message
+whisper p2 Compare evidence     private message to p2 (and sender)
+whisper p2,p3 Compare evidence  selected-group private message
+team Choose the same target    living wolves only, at night
+strike p2                      wolf night attack
+inspect p2                     seer night investigation
+protect p2                     guard night protection
+vote p2                        vote for another living player
+pass                           abstain from night action or vote
+help                           show commands
+quit                           disconnect
 ```
 
-The direct `docker exec` command works from any host folder. To avoid a
-"can't open play.py" error when a new terminal starts in your home directory,
-use these direct commands in five separate terminals after the moderator is
-started:
+Choices can change until the phase deadline. A disconnected player's saved
+choice stays in place, otherwise the missing action is an abstention. The
+minimal client does not implement arrow-key command history; type the command
+again rather than pressing Up. There is no automated reconnection: rejoin with
+the same Linux user after the connection closes.
 
-| Player terminal | Command |
+## Isolation added for Projects 2 and 3
+
+Project 1 put all players and the moderator in one container under distinct
+UIDs. Now each player container has:
+
+| Control | Player configuration |
 | --- | --- |
-| p1 | `docker exec -it --user p1 nightwatch-game python3 client.py` |
-| p2 | `docker exec -it --user p2 nightwatch-game python3 client.py` |
-| p3 | `docker exec -it --user p3 nightwatch-game python3 client.py` |
-| p4 | `docker exec -it --user p4 nightwatch-game python3 client.py` |
-| p5 | `docker exec -it --user p5 nightwatch-game python3 client.py` |
+| Linux user | p1 through p7, UIDs 10001 through 10007, shared group 2000 |
+| PID/filesystem namespaces | Separate from moderator and other players |
+| CPU | 0.25 of one CPU (`--cpus 0.25`) |
+| Memory / swap | 64 MiB maximum, memory-swap also 64 MiB, so no extra swap |
+| Processes/threads | cgroup maximum 32 |
+| File descriptors | 128 soft and hard limit |
+| Filesystem | Read-only root image; bounded 8 MiB /tmp for temporary files |
+| Network | `--network none`; no published ports |
+| Privilege | All capabilities dropped, no-new-privileges, default seccomp |
+| Shared socket | Read-only volume mount; directory 0750 and socket 0660 |
+| Match secrets | Moderator checkpoint volume is not mounted in players |
 
-All five are manual players; the other terminals do not make decisions for
-themselves. For automated players, use the separate `demo` command. Type game
-commands fresh; this minimal client does not implement Up-arrow command history.
-To stop a running game from any host terminal, use `docker stop nightwatch-game`.
-To discard it before creating a new match with `play.py start`, use `play.py stop`
-from the project folder.
+The moderator has a separate 128 MiB / one-CPU profile, its own UID 10000,
+and the only writable mounts for the socket directory and private state.
+A short trusted setup container uses CHOWN/FOWNER only to initialize those
+Docker-managed volumes. These capabilities are absent from gameplay containers.
+No container receives the Docker socket or a host filesystem bind mount.
+Docker-provided runtime paths such as /dev/shm can also be writable; read-only
+root does not mean that every kernel/runtime filesystem is read-only.
 
-To leave a player terminal, type `quit` or press Ctrl-C. Rejoin with the same
-`play.py join pN` command to retain that user's role and living/dead status.
-To finish and discard the current game container:
+Linux authenticates a connecting user's UID with SO_PEERCRED. A peer in another
+PID namespace may appear as PID 0 to the moderator; that value does not mean the
+players share a process. Clients print their local PID and namespace identifier,
+and the demo records distinct UID/namespace/container identities. Sender fields
+inside player messages never override the authenticated identity.
+
+This remains a **local-only, unencrypted UNIX socket design**. Encryption was a
+concern in Christopher's README review. The response here is to keep traffic off
+TCP networks, isolate processes, protect filesystem paths, and authenticate
+kernel UIDs. These are access controls, not TLS or a claim of encrypted traffic.
+The moderator, host root, and Docker administrator remain trusted and can inspect
+or alter the match. Containers share a kernel and are not a complete security
+boundary against kernel vulnerabilities or an administrator. A player can still
+abstain, disconnect, lie in chat, or misuse their own account.
+
+## Crash recovery
+
+The moderator stores private state at /var/lib/nightwatch/checkpoint.json in its
+own named volume. The directory is 0700 and the JSON file is 0600. Roles, living
+players, accepted choices, phase IDs, round, guard history, latest seer result,
+and remaining phase time are saved.
+
+State-changing callbacks stage their outgoing messages, write a temporary file,
+fsync it, atomically replace the checkpoint, and fsync the directory before
+publishing acknowledgements or state events. A checkpoint failure stops the
+moderator; it does not acknowledge an unsaved action. A private file lock rejects
+a second moderator. Recovery only unlinks an owned, stale socket after checking
+that it is not a live listener, symlink, or regular file.
+
+After a crash, resume the same moderator:
+
+```sh
+python3 play.py resume
+```
+
+Rejoin players with the same join commands. Roles and accepted actions are
+restored. The phase timer resumes from the remaining duration stored in the last
+checkpoint. This pauses at the last saved clock value, rather than counting the
+outage as gameplay time. Uncheckpointed timer progress and unsent acknowledgements
+may be lost. Public/private chat history is not replayed; the latest seer result
+is restored to the seer. This is crash recovery for one moderator, not replicated
+storage, automatic failover, or protection against deleting/corrupting its volume.
+Corrupt state fails closed rather than silently dealing a replacement match.
+Checkpoint I/O is synchronous, so slow storage can delay the event loop; the
+current design is a single moderator with small local snapshots.
+
+Stop a match with:
 
 ```sh
 python3 play.py stop
 ```
 
-This removes only the helper's `nightwatch-game` container. Start again for a
-new game. Do not start a second moderator with the same socket pathname.
+This stops containers and retains the moderator and volumes for resume. To delete
+this session's saved match and start a new one, explicitly use:
 
-## Rules and strategy
+```sh
+python3 play.py stop --purge
+python3 play.py start
+```
 
-1. **Night (60 s):** Each living wolf uses `strike pN`. With two wolves, a
-   unique plurality of their choices decides the target; a tie means no attack.
-   Wolves can privately coordinate using `team message`. The seer uses
-   `inspect pN` and receives a private wolf/village result at dawn. The guard
-   uses `protect pN`, including themselves, but cannot protect the same player
-   on consecutive nights. A protected target survives an attack.
-2. **Discussion (45 s):** Living players can `say message` publicly or
-   `whisper p2,p3 message` to a selected group. Evidence, alliances, and false
-   claims are part of the strategy. A claim to be the seer is ordinary chat;
-   the server does not certify it or reveal the sender's actual secret role.
-3. **Vote (30 s):** Use `vote pN` to select another living player. Players may
-   change their choices before the deadline or use `pass`. A unique plurality
-   eliminates a player. Ties and unanimous abstention eliminate nobody.
-4. Eliminated roles are revealed. Eliminated players can watch public events
-   but cannot act or chat. No wolves alive means a village win. Wolves win when
-   their count is at least the count of the other survivors. All roles are
-   revealed at the end.
+The helper only removes its labeled containers and volumes for the named session.
+It does not prune Docker or touch unrelated projects.
 
-All users can issue `status` or `help`. Actions that arrive with an old phase
-ID are rejected. A missed night action or vote counts as abstaining, so one
-disconnected client does not freeze the match.
+## Reproduce the new mechanism tests
 
-## Single-file communications API
+```sh
+python3 verify.py --evidence evidence/verification
+```
 
-The public API is in `comms.py`:
+This creates disposable sessions and tests bounded CPU load, a bounded process
+creation attempt, a memory allocation that exceeds the player's cap, private
+checkpoint access, socket-directory protection, read-only root, and distinct PID
+namespaces. It checks another player and the moderator remain responsive. It
+then force-kills the moderator mid-night, restarts from the saved volume,
+reconnects the same users, verifies the same roles/actions/phase, exercises a
+private group message, and finishes the match with a majority vote. Use `--keep`
+to retain its uniquely named evidence containers. It needs cgroup v2 and takes
+about a minute; exact timings depend on the machine. The tests deliberately
+stress only their own bounded containers.
+
+## Communications library API
+
+The sole game IPC implementation is comms.py. No game rules are in that file.
+It exposes:
 
 | API | Meaning |
 | --- | --- |
-| `Hub(path, allowed_users, on_join, on_message, on_leave)` | Configure the broker and async callbacks. |
-| `await hub.start()` | Bind a Linux UNIX stream socket; set mode 0660. |
-| `hub.send(user, message) -> bool` | Queue one JSON object for one user. |
-| `hub.multicast(users, message) -> int` | Queue one copy per unique selected user. |
-| `hub.broadcast(message) -> int` | Queue a copy for every connected user. |
-| `await hub.close()` | Stop accepting, close peers, and clean up the socket. |
-| `await Client.connect(path) -> Client` | Open one user's IPC endpoint. |
-| `await client.send(message)` | Write one framed JSON object. |
-| `await client.receive() -> dict` | Receive one complete framed JSON object. |
-| `await client.close()` | Close the endpoint. |
-| `ProtocolError` | Malformed, oversized, or non-object message. |
+| `Hub(path, allowed_users, on_join, on_message, on_leave, recover_stale=False)` | Authenticated local broker; callbacks are async |
+| `await Hub.start()` | Bind the socket and set mode 0660 |
+| `Hub.send(user, message)` | Enqueue one JSON object for one connected player; returns bool |
+| `Hub.multicast(users, message)` | Deduplicate selected users and enqueue copies; returns count |
+| `Hub.broadcast(message)` | Enqueue to all connected players; returns count |
+| `await Hub.close()` | Stop accepting and close peer sessions |
+| `await Client.connect(path)` | Connect as the current Linux process user |
+| `await Client.send(message)` | Write a framed JSON object |
+| `await Client.receive()` | Read a complete JSON object |
+| `await Client.close()` | Close the endpoint |
 
-Callback signatures are `async on_join(user, pid, uid)`,
-`async on_message(authenticated_user, message)`, and `async on_leave(user)`.
-`game.py` handles game-level authorization, phase IDs, and selected recipients.
-Transport framing and delivery stay entirely in `comms.py`.
+Frames have a four-byte big-endian length prefix and a UTF-8 JSON object body,
+limited to 16 KiB. Readers handle partial reads. Each peer has an independent
+64-frame outbound queue, three-second body/write timeouts, and a 30-command per
+five-second limit. Queue overflow or a stalled write disconnects that peer.
+Application fan-out is neither simultaneous nor atomic group delivery. Offline
+players can miss chat. Game rules and phase deadlines share an asyncio lock;
+per-peer I/O remains concurrent.
 
-The wire representation is a four-byte unsigned big-endian body length followed
-by a UTF-8 JSON object, at most 16,384 bytes. It does not assume one socket read
-equals one message. A client action looks like:
+## Source map
 
-```json
-{"cmd": "whisper", "phase_id": 2, "to": ["p2", "p3"], "text": "Compare evidence?"}
-```
+- comms.py: all player/moderator IPC, framing, identity, routing, backpressure.
+- game.py: original roles/phases plus strict-majority voting and transactional
+  checkpoint/event ordering.
+- checkpoint.py: moderator-private atomic snapshots and exclusive file lock.
+- server.py: moderator startup, checkpoint restore, signal/failure handling.
+- client.py: original interactive interface and optional demonstration bot.
+- play.py: host-side isolated Docker launch, demo, stop, and resume helper.
+- verify.py: reproducible host-side isolation/crash experiments using comms.py
+  driver processes; not an alternative game IPC library.
+- tests.py: rule, frame, real-socket, persistence, and recovery unit tests.
+- Dockerfile: Linux accounts, source image, private directory permissions.
+- COMMUNICATIONS_GUIDE.md: explanations and questions to check understanding.
 
-Sender names in delivered messages are inserted by the server from the kernel
-identity; a client-supplied `sender` field has no authority.
+The Canvas submission includes report.pdf, poster.pdf, fresh screenshots, and
+actual test logs. Private assignment reports and evidence are excluded from Git.
+The original Project 1 archive remains separately preserved.
 
-## Concurrency, security, and crash behavior
-
-- A separate client process runs under each player's UID. The moderator has
-  its own UID. The Dockerfile creates the accounts, and the demo records them.
-- `asyncio` schedules independent connection readers and outbound queue writers.
-  An application lock serializes game-state changes with phase deadlines.
-- The primitive is a reliable, ordered byte stream. Selective multicast and
-  broadcast are application-level fan-out over independent connections; UNIX
-  stream sockets do not natively broadcast to all players.
-- The broker reads `(pid, uid, gid)` using Linux `SO_PEERCRED` and resolves the
-  UID through the account database. A roster allowlist and one active session
-  per username reject outsiders and duplicate sessions.
-- `/run/nightwatch` is owned by `moderator:nightwatch` with mode 0750. Players
-  can reach the socket but cannot replace files in that directory. The socket
-  has mode 0660. Game source files are readable but not writable by players.
-- Every peer has a 64-frame outbound queue and a three-second write timeout.
-  Slow or overflowing peers are disconnected. Incoming commands are limited
-  to 30 per five seconds, and a started message body has a three-second timeout.
-- EOF removes only that user's transport session. The user can reconnect;
-  roles remain in moderator memory and deadlines continue without them.
-- Invalid roles, targets, phase IDs, command types, and control characters are
-  rejected. Only the moderator can eliminate a player or declare a winner.
-
-**Trust boundary:** the moderator, Linux root, and anyone with control of the
-Docker daemon are trusted administrators. This design does not hide secrets
-from them. It has no remote networking, encryption, persistent match recovery,
-or protection from an administrator killing/replacing the server. If the
-moderator crashes, the match must be restarted. An idle connection from a
-legitimate player can occupy that player's session until it disconnects; it
-cannot stop the game's timed phases. These are useful topics for peer review.
-
-## Files
-
-| File | Purpose |
-| --- | --- |
-| `comms.py` | **Entire inter-user communications library.** |
-| `game.py` | Authoritative role, phase, action, and win rules. |
-| `server.py` | Moderator CLI and graceful signal handling. |
-| `client.py` | Interactive text client and optional demo bot. |
-| `play.py` | Host-side Docker setup/play/test/demo helper. |
-| `tests.py` | Rule, frame, authentication, and socket integration tests. |
-| `Dockerfile`, `.dockerignore` | Reproducible Linux setup and distinct users. |
-| `COMMUNICATIONS_GUIDE.md` | Explanation and questions to check understanding. |
-
-## References
-
-- Python 3.13 asyncio streams: https://docs.python.org/3.13/library/asyncio-stream.html
-- Linux UNIX sockets and SO_PEERCRED: https://man7.org/linux/man-pages/man7/unix.7.html
-- Docker exec user selection: https://docs.docker.com/reference/cli/docker/container/exec/
-
-
-## Sharing
-
-The public repository contains the game source, Docker setup, tests, and
-communications documentation. Running a demo creates local transcripts under
-`evidence/demo/`; those generated files are ignored by Git. Assignment reports,
-feedback notes, and screenshots are maintained separately in the local project.
+References: [Docker resource limits](https://docs.docker.com/engine/containers/resource_constraints/),
+[Docker default seccomp](https://docs.docker.com/engine/security/seccomp/),
+[Linux UNIX sockets and credentials](https://man7.org/linux/man-pages/man7/unix.7.html).

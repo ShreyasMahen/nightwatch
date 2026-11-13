@@ -6,10 +6,12 @@ No game rules belong in this module. See README.md for the public API.
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 import pwd
 import socket
+import stat
 import struct
 import time
 from collections import deque
@@ -69,7 +71,7 @@ class Hub:
     synchronously, so one slow reader cannot block game state transitions.
     """
 
-    def __init__(self, path, allowed_users, on_join, on_message, on_leave):
+    def __init__(self, path, allowed_users, on_join, on_message, on_leave, recover_stale=False):
         if not hasattr(socket, "SO_PEERCRED"):
             raise RuntimeError("Nightwatch requires Linux SO_PEERCRED; use Docker on macOS")
         self.path = Path(path)
@@ -78,11 +80,22 @@ class Hub:
         self.peers = {}
         self.server = None
         self.tasks = set()
+        self.recover_stale = recover_stale
 
     async def start(self):
         # Refuse an occupied path. Never unlink an arbitrary pre-existing file.
         if self.path.exists() or self.path.is_symlink():
-            raise FileExistsError(f"Socket path already exists: {self.path}")
+            info = self.path.lstat()
+            if (not self.recover_stale or not stat.S_ISSOCK(info.st_mode)
+                    or info.st_uid != os.geteuid()):
+                raise FileExistsError(f"Socket path already exists: {self.path}")
+            # A private checkpoint lock prevents two moderators racing here.
+            # Never unlink a live socket, symlink, or regular file.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                result = probe.connect_ex(str(self.path))
+            if result != errno.ECONNREFUSED:
+                raise FileExistsError(f"Socket is live or cannot be checked: {self.path}")
+            self.path.unlink()
         self.server = await asyncio.start_unix_server(self._accept, path=str(self.path))
         os.chmod(self.path, 0o660)
 

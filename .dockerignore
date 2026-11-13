@@ -5,3 +5,6 @@ evidence
 *.pdf
 *.tgz
 .DS_Store
+.git
+FEEDBACK.md
+SUBMISSION_NOTES.md

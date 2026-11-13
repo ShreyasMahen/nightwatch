@@ -21,7 +21,7 @@ HELP = """Commands (player names are p1, p2, ...):
   pass                          abstain from this night action / vote
   help                          show commands
   quit                          disconnect (rejoin as the same Linux user)
-Choices may change until the phase deadline. A tie eliminates nobody.
+Choices may change until the phase deadline. A strict majority of living players is required to eliminate someone.
 """
 
 
@@ -156,6 +156,7 @@ async def main(args):
     console = Console(client, args.bot)
     print("NIGHTWATCH | Signal & Shadow", flush=True)
     print(f"Local process PID {os.getpid()} / UID {os.getuid()}", flush=True)
+    print("PID namespace: " + os.readlink("/proc/self/ns/pid"), flush=True)
     print("Demonstration bot enabled." if args.bot else HELP, flush=True)
     tasks = [asyncio.create_task(console.receive())]
     if not args.bot:
